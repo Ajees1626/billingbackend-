@@ -69,6 +69,15 @@ const authMiddleware = asyncHandler(async (req, res, next) => {
 })
 
 async function ensurePermanentAdmin() {
+  const db = getDb()
+  /**
+   * Stale data fixes:
+   * - Unique index on `users.usernameLower` — an old row with username "admin" but a different `id` blocks upsert.
+   * - `staff` with username "admin" would win login before `users` if we checked staff first.
+   */
+  await db.collection('staff').deleteMany({ usernameLower: ADMIN_USERNAME })
+  await db.collection('users').deleteMany({ usernameLower: ADMIN_USERNAME, id: { $ne: ADMIN_ID } })
+
   const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10)
   const doc = {
     id: ADMIN_ID,
@@ -80,7 +89,9 @@ async function ensurePermanentAdmin() {
     createdAt: new Date().toISOString(),
   }
   await replaceUserById(ADMIN_ID, doc)
-  console.log(`[pixdot] Admin login: username "${ADMIN_USERNAME}" / password "${ADMIN_PASSWORD}" / email ${ADMIN_EMAIL}`)
+  console.log(
+    `[pixdot] Admin ready — sign in: username "${ADMIN_USERNAME}" / password "${ADMIN_PASSWORD}" (email optional: ${ADMIN_EMAIL})`,
+  )
 }
 
 const app = express()
@@ -206,6 +217,31 @@ app.post(
       return
     }
 
+    /** `users` before `staff` so permanent admin is never shadowed by a stray staff row. */
+    const userByName = await findUserByUsername(username)
+    if (userByName) {
+      if (!userByName.passwordHash || !bcrypt.compareSync(password, userByName.passwordHash)) {
+        res.status(401).json({ error: 'Invalid username or password' })
+        return
+      }
+      const r = userByName.role
+      if (r === 'admin' || r === 'staff') {
+        const token = signToken(userByName)
+        res.json({ token, user: publicUser(userByName) })
+        return
+      }
+      if (r === 'client' && userByName.clientId) {
+        const token = signToken(userByName)
+        res.json({ token, user: publicUser(userByName) })
+        return
+      }
+      res.status(401).json({
+        error:
+          'Use your registered email as well — new client accounts need username, email, and password.',
+      })
+      return
+    }
+
     const staff = await findStaffByUsername(username)
     if (staff?.passwordHash && bcrypt.compareSync(password, staff.passwordHash)) {
       const token = signToken(staff)
@@ -213,28 +249,7 @@ app.post(
       return
     }
 
-    const userByName = await findUserByUsername(username)
-    if (!userByName?.passwordHash || !bcrypt.compareSync(password, userByName.passwordHash)) {
-      res.status(401).json({ error: 'Invalid username or password' })
-      return
-    }
-
-    const r = userByName.role
-    if (r === 'admin' || r === 'staff') {
-      const token = signToken(userByName)
-      res.json({ token, user: publicUser(userByName) })
-      return
-    }
-    if (r === 'client' && userByName.clientId) {
-      const token = signToken(userByName)
-      res.json({ token, user: publicUser(userByName) })
-      return
-    }
-
-    res.status(401).json({
-      error:
-        'Use your registered email as well — new client accounts need username, email, and password.',
-    })
+    res.status(401).json({ error: 'Invalid username or password' })
   }),
 )
 
